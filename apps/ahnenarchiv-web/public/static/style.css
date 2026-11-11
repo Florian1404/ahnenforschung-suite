@@ -19,3 +19,12 @@
 .entry-marriage { margin: 1.25rem 0; padding: 1rem; min-width: 0; border: 1px solid #d6d8cd; border-radius: 8px; }
 .entry-marriage legend { font-weight: 650; padding: 0 .45rem; }
 .entry-marriage [hidden] { display: none; }
+
+.import-person-select{width:100%;text-align:left;white-space:normal;overflow-wrap:anywhere;margin-top:4px}
+.import-picker{width:min(42rem,calc(100% - 2rem));max-height:90vh;overflow:auto}
+.import-picker-body{padding:16px 22px 22px}
+.import-picker-results{display:grid;gap:6px;max-height:48vh;overflow:auto;padding:4px}
+.import-picker-results button{display:grid;gap:3px;text-align:left;white-space:normal;overflow-wrap:anywhere}
+.import-picker-results button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
+
+.import-people.import-hide-recognized [data-import-recognized]{display:none}
