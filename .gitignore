@@ -1,0 +1,45 @@
+# Git contains code, never genealogy records or live-server data.
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+node_modules/
+.env
+.env.*
+!.env.example
+**/config.php
+**/config.local.php
+**/credentials.json
+**/secrets.json
+**/*-key.pem
+**/*.sqlite
+**/*.sqlite3
+**/*.sqlite3-*
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.log
+**/*.bak
+**/*.dump
+**/*.sql
+# Matricula runtime index, downloaded register scans and local paths
+**/matricula-bestand*.json
+**/matricula-katalog.sqlite3*
+**/matricula-local-config.json
+**/Matricula_Buecher/
+**/downloads/
+**/scans/
+# Personally identifiable records and media from production
+apps/ahnenarchiv-web/private/imports/
+apps/ahnenarchiv-web/private/media/
+apps/ahnenarchiv-web/private/data/
+apps/ahnenarchiv-web/private/backups/
+apps/ahnenarchiv-web/public/uploads/
+research/private/
+research/originals/
+research/exports/
+*.ged
+*.gedcom

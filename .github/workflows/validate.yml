@@ -1,0 +1,19 @@
+name: Syntax-Checks
+on:
+  push:
+  pull_request:
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python Syntax
+        run: python -m compileall -q tools/ legacy/ahnenarchiv-desktop/app/ legacy/ahnenarchiv-desktop/desktop/
+      - name: PHP Syntax
+        run: |
+          find apps/ahnenarchiv-web -name '*.php' -print0 | xargs -0 -n1 php -l
+      - name: JavaScript Syntax
+        run: node --check apps/ahnenarchiv-web/public/static/app.js
