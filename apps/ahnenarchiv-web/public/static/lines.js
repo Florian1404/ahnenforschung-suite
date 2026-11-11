@@ -64,10 +64,10 @@ const AhnenLines=(()=>{
   const familyIds=new Set(families.map(f=>f.id));
   const sameEvent=(x,y)=>x?.datum?.iso?x.datum.iso===y?.datum?.iso:!!x?.ort_original&&x.ort_original===y?.ort_original&&!y?.datum?.iso;
   const mirrorsPrimary=embedded.some(h=>familyIds.has(h.familie_id)&&sameEvent(p.hochzeit,h.ereignis))||
-   families.some(f=>[f.hochzeit,...(Array.isArray(f.hochzeit.alternativen)?f.hochzeit.alternativen.map(h=>h.wert):[])].some(e=>sameEvent(p.hochzeit,e)));
-  return [...families.map(f=>({event:f.hochzeit,ids:f.partner_person_ids})),
-   ...embedded.filter(h=>complete(h.ereignis)&&!familyIds.has(h.familie_id)).map(h=>({event:h.ereignis,ids:h.partner_person_ids||[]})),
-   ...(!mirrorsPrimary&&complete(p.hochzeit)?[{event:p.hochzeit,ids:[],primary:true}]:[])];
+   families.some(f=>[f.hochzeit,...(Array.isArray(f.hochzeit?.alternativen)?f.hochzeit?.alternativen.map(h=>h.wert):[])].some(e=>sameEvent(p.hochzeit,e)));
+  return [...families.map(f=>({event:f.hochzeit,ids:f.partner_person_ids,source:'family',refId:f.id})),
+   ...embedded.filter(h=>complete(h.ereignis)&&!familyIds.has(h.familie_id)).map(h=>({event:h.ereignis,ids:h.partner_person_ids||[],source:'person',refId:p.id})),
+   ...(!mirrorsPrimary&&complete(p.hochzeit)?[{event:p.hochzeit,ids:[],primary:true,source:'person',refId:p.id}]:[])];
  }
  function weddingEvent(p,a){const events=marriageRows(p,a).map(r=>r.event);return events.filter(e=>dateKey(e.datum)!==null).sort((a,b)=>dateKey(a.datum)-dateKey(b.datum))[0]||events[0]||null;}
  function wedding(p,a){return weddingEvent(p,a)?.datum||null;}

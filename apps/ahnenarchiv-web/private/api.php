@@ -8,6 +8,7 @@ require_once __DIR__.'/modules.php';
 require_once __DIR__.'/review.php';
 require_once __DIR__.'/person-entry.php';
 require_once __DIR__.'/person-admin.php';
+require_once __DIR__.'/event-admin.php';
 require_once __DIR__.'/kreutzwiesner.php';
 
 function api(PDO $db,array $cfg,string $root,string $method,string $path): mixed {
@@ -65,6 +66,7 @@ function api(PDO $db,array $cfg,string $root,string $method,string $path): mixed
     if($path==='/api/corrections/family-confirmation'&&$method==='POST')return familyConfirmationSubmit($db,$u);
     if($path==='/api/corrections/portraits'&&$method==='POST')return portraitFixSubmit($db,$u);
     if(str_starts_with($path,'/api/person-admin/'))return paAdminApi($db,$u,$method,$path);
+    if(str_starts_with($path,'/api/event-admin/'))return eaAdminApi($db,$u,$method,$path);
     if(str_starts_with($path,'/api/imports'))return importApi($db,$cfg,$root,$u,$method,$path);
     if($path==='/api/account/password'&&$method==='POST'){
         throttle($db,'password-change');$b=body();$old=$b['current_password']??'';$new=$b['new_password']??null;
