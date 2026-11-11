@@ -1,9 +1,9 @@
-﻿import os
+import os
 import json
 import re
 import time
-import random
 import threading
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from urllib.parse import urljoin, urlparse
@@ -19,232 +19,219 @@ import customtkinter as ctk
 # 1. SEPARATER PARSER FÜR DIE ECHTE MATRICULA-WEBSITE
 # =====================================================================
 class MatriculaParser:
-    def __init__(self):
-        self.base_url = "https://data.matricula-online.eu"
-        self.main_url = f"{self.base_url}/de/"
+    """Bestandsindex; lädt keine Kirchenbuchbilder."""
+    BASE = "https://data.matricula-online.eu"
+    SLUGS = {"Österreich": "oesterreich", "Deutschland": "deutschland",
+             "Polen": "polen", "Serbien": "serbien", "Luxemburg": "luxemburg",
+             "Bosnien": "bosnien", "Slowenien": "slowenien", "Italien": "italien",
+             "Privatarchiv": "privatarchive", "Schweiz": "schweiz"}
+
+    def __init__(self, pause=3.0):
         self.session = requests.Session()
-        
-        # PERFEKTE TARNUNG: Vollständige Header eines echten Google Chrome Browsers
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
-        })
-        
-    def _get_soup(self, url):
-        try:
-            # Zufällige Wartezeit zwischen 0.5 und 1.5 Sekunden gegen Muster-Erkennung (WAF)
-            time.sleep(random.uniform(0.5, 1.5)) 
-            res = self.session.get(url, timeout=15)
-            
-            if res.status_code == 403:
-                raise PermissionError("Zugriff verweigert (HTTP 403 Forbidden).\nDeine IP wurde eventuell temporär blockiert. Nutze einen VPN oder starte deinen Router neu.")
-            if res.status_code != 200:
-                return None
-                
-            return BeautifulSoup(res.text, 'html.parser')
-        except requests.RequestException:
-            return None
+        self.session.headers.update({"User-Agent": "MatriculaBestandsbrowser/3.0 (private genealogical index)",
+                                     "Accept-Language": "de,en;q=0.7"})
+        self.pause = pause
+        self.last_request = 0.0
+        self.errors = []
+        self.visited = set()
+        self.stop_event = threading.Event()
 
-    def _iter_paginated(self, start_url, max_pages=200):
-        visited = set()
-        queue = [start_url]
-        while queue and len(visited) < max_pages:
-            url = queue.pop(0)
-            if url in visited:
-                continue
-            visited.add(url)
-            soup = self._get_soup(url)
-            if soup is None:
-                continue
-            yield soup
-            base_path = urlparse(start_url).path
-            for a in soup.select("a[href]"):
-                href = a.get("href", "").strip()
-                if "?page=" in href or "&page=" in href:
-                    full = urljoin(url, href)
-                    if urlparse(full).path == base_path and full not in visited:
-                        queue.append(full)
+    @staticmethod
+    def path_segments(url):
+        return [p for p in urlparse(url).path.split("/") if p]
 
-    def _is_valid_link(self, href, text):
-        if not href or not text or "#" in href:
-            return False
-        text_lower = text.strip().lower()
-        if "{" in text or "}" in text:
-            return False
-        
-        # Exakter Abgleich für Systemlinks
-        exact_blacklist = {
-            "anmelden", "impressum", "datenschutz", "matricula", "bestände",
-            "landkarte", "ortssuche", "deutsch", "english", "slovenščina",
-            "česky", "italiano", "kontakt", "unterstützen",
-            "allgemeine infos", "nutzungsbedingungen", "hilfe", "zum inhalt springen",
-            "weiter", "zurück", "nächste", "vorherige", "«", "»"
-        }
-        if text_lower in exact_blacklist:
-            return False
-            
-        # Teilstring-Sperren für Navigations-Reste
-        substring_blacklist = ["zum inhalt springen", "nutzungsbedingungen"]
-        if any(x in text_lower for x in substring_blacklist):
-            return False
-            
-        return True
+    @staticmethod
+    def clean_url(url):
+        p = urlparse(url)
+        return p._replace(query="", fragment="").geturl().rstrip("/") + "/"
 
-    def _get_alphabetical_links(self, base_url, soup):
-        """Erkennt, ob eine Diözese ein A-Z Register besitzt und extrahiert die Links."""
-        alpha_links = {}
-        base_path = urlparse(base_url).path.rstrip("/") + "/"
+    def get_soup(self, url):
+        if self.stop_event.is_set():
+            raise InterruptedError("Scan wurde angehalten")
+        wait = max(0, self.pause - (time.monotonic() - self.last_request))
+        if wait:
+            time.sleep(wait)
+        self.last_request = time.monotonic()
+        for attempt in range(3):
+            try:
+                resp = self.session.get(url, timeout=25)
+                if resp.status_code in (403, 429):
+                    raise PermissionError(f"HTTP {resp.status_code} bei {url}. Scan beendet; keine Umgehung von Zugriffssperren.")
+                if resp.status_code in (500, 502, 503, 504):
+                    time.sleep(min(30, 5 * (attempt + 1)))
+                    continue
+                resp.raise_for_status()
+                return BeautifulSoup(resp.text, "html.parser")
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if attempt == 2:
+                    raise RuntimeError(f"Netzwerkfehler bei {url}: {exc}") from exc
+                time.sleep(5 * (attempt + 1))
+        raise RuntimeError(f"Serverfehler bei {url}")
+
+    def child_links(self, parent_url, soup):
+        """Nur echte Pfadkinder derselben Domain, keine Navigation oder Buchseiten."""
+        parent = self.path_segments(parent_url)
+        found = {}
         for a in soup.select("a[href]"):
-            href = a.get("href", "").strip()
-            text = a.get_text(strip=True)
-            if len(text) == 1 and text.isupper() and text.isalpha():
-                full_url = urljoin(base_url, href)
-                full_path = urlparse(full_url).path.rstrip("/") + "/"
-                if full_path.startswith(base_path) and len(full_path.replace(base_path, "").strip("/")) == 1:
-                    alpha_links[text] = full_url
-        return alpha_links
-
-    def _collect_sublinks(self, parent_url, soups):
-        links = {}
-        parent_path = urlparse(parent_url).path.rstrip("/") + "/"
-        for soup in soups:
-            for a in soup.select("a[href]"):
-                href = a.get("href", "").strip()
-                text = a.get_text(" ", strip=True).strip()
-                if not self._is_valid_link(href, text):
-                    continue
-                full_url = urljoin(parent_url, href)
-                full_path = urlparse(full_url).path
-                if not full_path.startswith(parent_path):
-                    continue
-                if full_path.rstrip("/") + "/" == parent_path:
-                    continue
-                if "?page=" in full_url:
-                    continue
-                if any(x in full_url.lower() for x in ["facebook", "twitter", "browser"]):
-                    continue
-                clean_name = re.sub(r"^\d+\s*", "", text).strip()
-                
-                # Buchstaben-Index-Links herausfiltern (z.B. "A", "B" etc.)
-                if len(clean_name) == 1 and clean_name.isupper():
-                    continue
-                    
-                if clean_name and full_url not in links.values():
-                    links[clean_name] = full_url
-        return links
-
-    def scrape_land_live(self, land_klartext, status_callback):
-        """EXTRAKTOR-LOGIK: Holt die Bestandsstruktur eines Landes."""
-        status_callback("🌐 Ermittle Länder-URL...")
-        land_clean = re.sub(r"\s*\(.*?\)", "", land_klartext).strip()
-        such_begriff = land_clean.lower()
-        
-        if such_begriff in self.slug_map:
-            slug = self.slug_map[such_begriff]
-            land_url = f"{self.base_url}/de/{slug}/"
-        else:
-            slug = (such_begriff
-                    .replace("ö", "oesterreich" if such_begriff == "österreich" else "oe")
-                    .replace("ä", "ae")
-                    .replace("ü", "ue")
-                    .replace("ß", "ss"))
-            land_url = f"{self.base_url}/de/{slug}/"
-
-        status_callback(f"🌐 Öffne Länderseite: {land_url}")
-
-        land_soups = list(self._iter_paginated(land_url))
-        if not land_soups:
-            raise Exception(f"Länderseite nicht erreichbar oder keine Daten unter:\n{land_url}")
-
-        dioezesen_links = self._collect_sublinks(land_url, land_soups)
-        total_dioe = len(dioezesen_links)
-        if total_dioe == 0:
-            raise Exception(f"Keine gültigen Diözesen gefunden.\nURL: {land_url}")
-
-        land_dict = {}
-
-        for idx_d, (d_name, d_url) in enumerate(sorted(dioezesen_links.items()), 1):
-            status_callback(f"🌐 [{idx_d}/{total_dioe}] Scanne Archiv: {d_name}...")
-            land_dict[d_name] = {}
-
-            dioe_soups = list(self._iter_paginated(d_url))
-            if not dioe_soups:
+            name = a.get_text(" ", strip=True)
+            href = a.get("href", "")
+            target = self.clean_url(urljoin(parent_url, href))
+            seg = self.path_segments(target)
+            if (urlparse(target).netloc != urlparse(self.BASE).netloc or
+                len(seg) != len(parent) + 1 or seg[:len(parent)] != parent or
+                not name or len(name) < 2):
                 continue
+            name = re.sub(r"^\s*\d+\s+", "", name).strip()
+            found[target] = name
+        return found
 
-            # PRÜFUNG AUF A-Z REGISTER (für Österreich / Deutschland essenziell)
-            alpha_links = self._get_alphabetical_links(d_url, dioe_soups[0])
-            orte_links = {}
+    def pages(self, url, max_pages=200):
+        """Ermittelt ?page= / ?p= Seiten, ohne ?pg= Bildseiten zu verfolgen."""
+        queue = [url]
+        seen = set()
+        while queue:
+            page = queue.pop(0)
+            if page in seen:
+                continue
+            if len(seen) >= max_pages:
+                raise RuntimeError(f"Mehr als {max_pages} Ergebnisseiten: {url}")
+            seen.add(page)
+            soup = self.get_soup(page)
+            yield soup
+            for a in soup.select("a[href]"):
+                nxt = urljoin(page, a['href'])
+                parsed = urlparse(nxt)
+                if (parsed.netloc == urlparse(url).netloc and
+                    parsed.path.rstrip('/') == urlparse(url).path.rstrip('/') and
+                    re.search(r"(?:^|&)(?:page|p)=\d+", parsed.query) and
+                    nxt not in seen and nxt not in queue):
+                    queue.append(nxt)
 
-            if alpha_links:
-                total_alphas = len(alpha_links)
-                for idx_a, (letter, alpha_url) in enumerate(sorted(alpha_links.items()), 1):
-                    status_callback(f"🌐 [{idx_d}/{total_dioe}] {d_name} → Register '{letter}' ({idx_a}/{total_alphas})...")
-                    alpha_soups = list(self._iter_paginated(alpha_url))
-                    sub_orte = self._collect_sublinks(alpha_url, alpha_soups)
-                    orte_links.update(sub_orte)
+    @staticmethod
+    def expected_count(soup):
+        # Seiten mit Überschrift z.B. "Matriken ... 1 gesamt"
+        txt = soup.get_text(" ", strip=True)
+        m = re.search(r"\b(\d+)\s+gesamt\b", txt, re.I)
+        return int(m.group(1)) if m else None
+
+    def parse_books(self, ort_url, soup):
+        """Foto-Link direkt aus Zeile, ansonsten eindeutige Signatur aus Tabellenzeile.
+        Keine Bild- oder ?pg=Folgeseiten nötig.
+        """
+        books = {}
+        for tr in soup.select("tr"):
+            cells = tr.find_all("td", recursive=False)
+            if len(cells) < 2:
+                continue
+            texts = [c.get_text(" ", strip=True) for c in cells]
+            row_text = " ".join(texts)
+            # Matricula verwendet oft eine leere Kameraspalte vor Signatur und Typ.
+            candidates = []
+            for c in cells:
+                for a in c.select("a[href]"):
+                    href = urljoin(ort_url, a['href'])
+                    if len(self.path_segments(href)) == len(self.path_segments(ort_url)) + 1:
+                        candidates.append(href)
+                for element in c.select("[data-href], [onclick]"):
+                    href = element.get('data-href', '')
+                    if not href:
+                        match = re.search(r"['\"]([^'\"]+/[^'\"]+)['\"]", element.get('onclick',''))
+                        href = match.group(1) if match else ''
+                    if href:
+                        full = urljoin(ort_url, href)
+                        if len(self.path_segments(full)) == len(self.path_segments(ort_url)) + 1:
+                            candidates.append(full)
+            # Vorhandener Buchlink gewinnt; sonst Signatur aus Tabellen-Spalten.
+            signature = ''
+            url = ''
+            if candidates:
+                url = self.clean_url(candidates[0])
+                signature = self.path_segments(url)[-1]
             else:
-                orte_links = self._collect_sublinks(d_url, dioe_soups)
+                # Tabellensignatur ist meist erste nichtleere Zelle. Nur bei
+                # weiteren Typ-/Datumsangaben eine URL aus der Signatur ableiten.
+                values = [x for x in texts if x]
+                if len(values) < 2:
+                    continue
+                signature = values[0]
+                if not re.fullmatch(r"[\w.\-]+", signature, re.UNICODE):
+                    continue
+                if not (re.search(r"\b(1[5-9]\d\d|20\d\d)\b", row_text) or
+                        re.search(r"tauf|trau|heirat|sterbe|tod|matrik|firm|geburt", row_text, re.I)):
+                    continue
+                url = urljoin(self.clean_url(ort_url), requests.utils.requote_uri(signature) + "/")
+            if not signature or not url:
+                continue
+            # Metadaten über den tatsächlich sichtbaren Tabelleninhalt hinaus
+            # nicht erraten. Original-Tabellenzeile bleibt für spätere Analyse.
+            values = [x for x in texts if x]
+            typ = next((v for v in values if v != signature and
+                        re.search(r"tauf|trau|heirat|sterbe|tod|matrik|firm|geburt", v, re.I)), "")
+            zeitraum = next((v for v in values if re.search(r"\b\d{4}\s*[-–]\s*\d{4}\b", v)), "")
+            url = self.clean_url(url) + "?pg=1"
+            books[url] = {"titel": typ or signature, "typ": typ,
+                          "zeitraum": zeitraum, "signatur": signature,
+                          "url": url, "tabellenzeile": row_text}
+        return list(books.values())
 
-            total_orte = len(orte_links)
-            
-            for idx_o, (o_name, o_url) in enumerate(sorted(orte_links.items()), 1):
-                status_callback(
-                    f"🌐 [{idx_d}/{total_dioe}] {d_name} → "
-                    f"[{idx_o}/{total_orte}] {o_name}"
-                )
-                land_dict[d_name][o_name] = []
-
-                for soup_ort in self._iter_paginated(o_url):
-                    for row in soup_ort.select("table tr"):
-                        if row.find("th"):  # Tabellenkopf überspringen
-                            continue
-                        cols = row.find_all("td")
-                        if len(cols) < 3:
-                            continue
-                        try:
-                            first_td = cols[0]
-                            titel_a = first_td.find("a")
-
-                            titel_text = (titel_a.get_text(strip=True)
-                                          if titel_a else first_td.get_text(strip=True))
-                            url_text = (urljoin(o_url, titel_a.get('href'))
-                                        if titel_a and titel_a.get('href') else o_url)
-
-                            typ_text = cols[1].get_text(strip=True) if len(cols) > 1 else "N/A"
-                            zeitraum_text = cols[2].get_text(strip=True) if len(cols) > 2 else "N/A"
-                            signatur_text = cols[3].get_text(strip=True) if len(cols) > 3 else "N/A"
-
-                            if not titel_text:
-                                continue
-
-                            land_dict[d_name][o_name].append({
-                                "titel": titel_text,
-                                "typ": typ_text,
-                                "zeitraum": zeitraum_text,
-                                "signatur": signatur_text,
-                                "url": url_text
-                            })
-                        except Exception:
-                            continue
-
-                if not land_dict[d_name][o_name]:
-                    del land_dict[d_name][o_name]
-
-            if not land_dict[d_name]:
-                del land_dict[d_name]
-
-        if not land_dict:
-            raise Exception("Scan abgeschlossen, aber keine Kirchenbücher gefunden.")
-        return land_dict
+    def scrape_land_live(self, land, callback, checkpoint=None):
+        self.errors = []
+        self.visited = set()
+        self.stop_event.clear()
+        slug = self.SLUGS.get(land)
+        if not slug:
+            raise ValueError(f"Unbekannter Länder-Slug: {land}. URL bitte prüfen.")
+        country_url = f"{self.BASE}/de/{slug}/"
+        callback(f"Lade Länderübersicht: {country_url}")
+        archives = {}
+        for soup in self.pages(country_url):
+            archives.update(self.child_links(country_url, soup))
+        if not archives:
+            raise RuntimeError("Keine Archive gefunden: möglicherweise wurde die Seitenstruktur geändert.")
+        result = (checkpoint or {}).copy()
+        for i, (archive_url, archive_name) in enumerate(sorted(archives.items()), 1):
+            callback(f"Archiv {i}/{len(archives)}: {archive_name}")
+            locations = {}
+            try:
+                for soup in self.pages(archive_url):
+                    locations.update(self.child_links(archive_url, soup))
+                    # Alphabetregister ggf. über ?page= eingebunden
+            except PermissionError:
+                raise
+            except Exception as exc:
+                self.errors.append(f"{archive_url}: {exc}")
+                continue
+            if not locations:
+                self.errors.append(f"Keine Orte in {archive_url}")
+            archive_data = result.setdefault(archive_name, {})
+            for j, (ort_url, ort_name) in enumerate(sorted(locations.items()), 1):
+                if self.stop_event.is_set():
+                    raise InterruptedError("Abbruch")
+                if ort_name in archive_data and archive_data[ort_name]:
+                    continue
+                callback(f"{archive_name} · Ort {j}/{len(locations)}: {ort_name}")
+                try:
+                    books = {}
+                    expected = None
+                    for soup in self.pages(ort_url):
+                        if expected is None:
+                            expected = self.expected_count(soup)
+                        for b in self.parse_books(ort_url, soup):
+                            books[b['url']] = b
+                    if expected is not None and len(books) != expected:
+                        self.errors.append(f"Buchanzahl {ort_url}: erwartet {expected}, gefunden {len(books)}")
+                    if not books:
+                        self.errors.append(f"Keine Bücher erkannt: {ort_url}")
+                    else:
+                        archive_data[ort_name] = list(books.values())
+                except PermissionError:
+                    raise
+                except Exception as exc:
+                    self.errors.append(f"{ort_url}: {exc}")
+                if checkpoint is not None:
+                    checkpoint.clear()
+                    checkpoint.update(result)
+        return result
 
 
 # =====================================================================
@@ -350,6 +337,9 @@ class MatriculaBrowser(ctk.CTk):
                                              fg_color="#dc3545", hover_color="#bd2130",
                                              command=self.delete_json_file)
         self.btn_delete_json.pack(side="left")
+        self.btn_stop = ctk.CTkButton(self.button_frame, text="⏹ Stop", width=70,
+                                      command=lambda: self.parser.stop_event.set())
+        self.btn_stop.pack(side="left", padx=(8, 0))
 
         # Rechtsbündige Knöpfe
         self.btn_excel = ctk.CTkButton(self.button_frame, text="📊 Excel-Linkliste erstellen",
@@ -558,15 +548,41 @@ class MatriculaBrowser(ctk.CTk):
         if filepath:
             self.load_json_data(filepath=filepath, silent=False)
 
-    def save_json_data(self, land):
-        """Speichert die Länderstruktur sauber ab."""
-        try:
-            filename = self.get_filename_for_land(land)
-            land_data = {land: self.db_data.get(land, {})}
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(land_data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            messagebox.showerror("Fehler", f"Fehler beim Speichern der JSON für {land}:\n{e}")
+    def save_json_data(self, land, data=None, errors=None, incomplete=False):
+        """JSON + vollständige TXT-Liste, atomar gespeichert; Scanreport separat."""
+        data = data if data is not None else self.db_data.get(land, {})
+        errors = errors if errors is not None else []
+        filename = Path(self.get_filename_for_land(land))
+        tmp = filename.with_suffix('.json.tmp')
+        with tmp.open('w', encoding='utf-8') as f:
+            json.dump({land: data}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, filename)
+        txt = filename.with_suffix('.txt')
+        lines = []
+        tree = {"land": land, "archive": []}
+        for archiv, orte in sorted(data.items()):
+            archiv_node = {"name": archiv, "url": "", "orte": []}
+            tree["archive"].append(archiv_node)
+            for ort, buecher in sorted(orte.items()):
+                ort_node = {"name": ort, "url": "", "kirchenbuecher": buecher}
+                archiv_node["orte"].append(ort_node)
+                for buch in buecher:
+                    seg = urlparse(buch.get('url','')).path.rstrip('/').rsplit('/', 1)[0]
+                    ort_url = self.parser.BASE + seg + '/'
+                    dioe_url = self.parser.BASE + seg.rsplit('/', 1)[0] + '/'
+                    ort_node['url'] = ort_url
+                    archiv_node['url'] = dioe_url
+                    lines.append('\t'.join([land, archiv, dioe_url, ort,
+                        ort_url, buch.get('signatur',''), buch.get('typ',''),
+                        buch.get('zeitraum',''), buch.get('url','')]))
+        tree_path = filename.with_name(filename.stem + '-hierarchie.json')
+        tree_path.write_text(json.dumps(tree, ensure_ascii=False, indent=2), encoding='utf-8')
+        txt_tmp = txt.with_suffix('.txt.tmp')
+        txt_tmp.write_text('\n'.join(lines) + ('\n' if lines else ''), encoding='utf-8')
+        os.replace(txt_tmp, txt)
+        report = filename.with_suffix('.status.json')
+        report.write_text(json.dumps({'land':land, 'vollstaendig':not incomplete and not errors,
+                           'anzahl_buecher':len(lines), 'fehler':errors}, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def delete_json_file(self):
         land = self.combo_land.get()
@@ -618,26 +634,40 @@ class MatriculaBrowser(ctk.CTk):
 
     def scraping_worker(self, land):
         try:
-            extracted_data = self.parser.scrape_land_live(
-                land,
-                lambda text: self.after(0, lambda t=text: self.set_status(t, busy=True))
-            )
-            
             land_clean = re.sub(r"\s*\(.*?\)", "", land).strip()
+            # Erst vorhandenen Katalog als Checkpoint verwenden. Bereits gefundene
+            # Bücher bleiben bei Netzwerkfehlern erhalten.
+            existing = dict(self.db_data.get(land_clean, {}))
+            extracted_data = self.parser.scrape_land_live(
+                land_clean,
+                lambda text: self.after(0, lambda t=text: self.set_status(t, busy=True)),
+                checkpoint=existing
+            )
             self.db_data[land_clean] = extracted_data
-            self.save_json_data(land_clean)
-            
+            self.save_json_data(land_clean, extracted_data, self.parser.errors)
             self.after(0, lambda: self.scraping_finished_success(land_clean))
         except Exception as e:
             error_msg = str(e)
+            land_clean = re.sub(r"\s*\(.*?\)", "", land).strip()
+            if 'existing' in locals() and existing:
+                self.db_data[land_clean] = existing
+                try:
+                    self.save_json_data(land_clean, existing, self.parser.errors + [error_msg], incomplete=True)
+                except Exception as save_error:
+                    error_msg += f"; Speichern fehlgeschlagen: {save_error}"
             self.after(0, lambda msg=error_msg: self.scraping_finished_error(msg))
 
     def scraping_finished_success(self, land):
         self.set_status("Bereit.")
         self.btn_refresh_land.configure(state="normal")
         self.btn_delete_json.configure(state="normal")
-        messagebox.showinfo("Scraping beendet",
-                            f"Die Bestandsdaten für '{land}' wurden erfolgreich extrahiert.")
+        msg = (f"Die Bestandsdaten für '{land}' wurden gespeichert.\n"
+               f"JSON + TXT + status.json im Programmordner.\n"
+               f"Fehler/Warnungen: {len(self.parser.errors)}")
+        if self.parser.errors:
+            messagebox.showwarning("Scan nur teilweise bestätigt", msg)
+        else:
+            messagebox.showinfo("Scraping beendet", msg)
         self.load_json_data(silent=True)
 
     def scraping_finished_error(self, error_msg):
@@ -711,10 +741,10 @@ class MatriculaBrowser(ctk.CTk):
             "🏛️ Matricula Bestandsbrowser - Konzept\n\n"
             "1. Streng datensparend:\n"
             "Es werden niemals Bilder geladen. Rein textbasierte URLs.\n\n"
-            "2. IP-Schutz durch Live-Scraping pro Land:\n"
-            "Keine Massen-Downloads. Live-Update findet nur gezielt pro Land statt.\n\n"
-            "3. Schnittstelle für Downloader:\n"
-            "Generiert einen gezielten Excel-Export (.xlsx) für separate Download-Skripte."
+            "2. Schonendes Indexieren: mindestens drei Sekunden Abstand.\n"
+            "Bei HTTP 403/429 wird sofort gestoppt.\n\n"
+            "3. JSON/TXT pro Land mit separatem Prüfstatus.\n"
+            "Fehlende Bücher werden im Statusbericht vermerkt."
         )
         txt = ctk.CTkTextbox(help_win, font=("Arial", 12))
         txt.pack(fill="both", expand=True, padx=15, pady=15)
