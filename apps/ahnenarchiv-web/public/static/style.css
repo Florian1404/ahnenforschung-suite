@@ -28,3 +28,7 @@
 .import-picker-results button:focus-visible{outline:2px solid var(--ink);outline-offset:1px}
 
 .import-people.import-hide-recognized [data-import-recognized]{display:none}
+
+
+/* 2.1.4: Personenverwaltung */
+.person-tile{min-width:0}.person-tile>.person-card{width:100%;height:auto}.person-tools{display:flex;gap:7px;flex-wrap:wrap;padding:9px 3px}.person-tools button{font-size:13px;padding:8px 12px}.danger{color:var(--danger);border-color:#c88484}.danger:hover{background:#fff0ed}.person-admin-dialog{width:min(650px,94vw);max-width:94vw;max-height:90dvh;overflow:auto;border:1px solid var(--line);border-radius:15px;background:var(--paper);color:var(--ink);padding:0;box-shadow:0 24px 70px #0006}.person-admin-dialog::backdrop{background:#0b1e17c9;backdrop-filter:blur(3px)}.person-admin-header{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:18px 22px;border-bottom:1px solid var(--line)}.person-admin-header h2{margin:0}.person-admin-content{padding:20px 22px}.person-admin-dialog label{display:block;margin:14px 0 5px}.person-admin-dialog input,.person-admin-dialog select{width:100%}.person-admin-dialog .person-admin-impact{border:1px solid var(--line);padding:14px;border-radius:10px;background:var(--white)}.person-admin-dialog .person-admin-history{display:grid;gap:12px;max-height:52dvh;overflow:auto}.person-admin-dialog .person-admin-history .source{overflow-wrap:anywhere}.person-admin-dialog .small.break{display:block}.person-admin-dialog [data-apply]:disabled{opacity:.45;cursor:not-allowed}
