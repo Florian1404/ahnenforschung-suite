@@ -1,0 +1,8 @@
+{
+  "id": "chronicle",
+  "title": "Chronik & Jahrestage",
+  "description": "Lebensereignisse zeitlich einordnen und Geburtstage, Hochzeitstage und Gedenktage nach Monat anzeigen.",
+  "version": "1.0.0",
+  "min_core": "1.5.0",
+  "api": 1
+}

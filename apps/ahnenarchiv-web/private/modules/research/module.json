@@ -1,0 +1,8 @@
+{
+  "id": "research",
+  "title": "Recherche & Datenprüfung",
+  "description": "Gezielt suchen, mögliche Datenfehler und Dubletten prüfen sowie Quellen und Fundstellen nachvollziehen.",
+  "version": "1.0.0",
+  "min_core": "1.5.0",
+  "api": 1
+}
