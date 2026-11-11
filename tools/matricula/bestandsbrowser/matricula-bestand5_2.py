@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Matricula Bestandsbrowser v5.1 – nur Bestandsmetadaten, keine Buchbilder.
-Installation: py -m pip install requests beautifulsoup4 customtkinter
-Start: py matricula-bestand5_1.py
+"""Matricula Bestandsbrowser v5.2 · Bestandsindex, SQLite-Downloadkatalog, Einzelbuch-Download.
+Installation (Python >= 3.12):
+    py -m pip install requests beautifulsoup4 customtkinter matricula-online-scraper
+Optional für PDFs:
+    py -m pip install img2pdf
+Start:
+    py matricula-bestand5_2.py
+
+Bestehende v4/v5.1 JSONs bleiben unverändert; Downloadstatus in SQLite.
 """
 import json
 import re
@@ -492,6 +498,383 @@ class Scraper:
             if journal_path(land).exists():
                 persist_full(data)
 
+# =====================================================================
+# 6. Lokaler Downloadkatalog (SQLite) und Einzelbuch-Downloader
+# =====================================================================
+import hashlib
+from contextlib import contextmanager
+import importlib.util
+import queue
+import sqlite3
+import subprocess
+import sys
+
+DATABASE_PATH = ROOTDIR / 'matricula-katalog.sqlite3'
+DEFAULT_DOWNLOAD_ROOT = ROOTDIR / 'Matricula_Buecher'
+IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.jp2', '.j2k'}
+DOWNLOAD_IDLE_TIMEOUT = 20 * 60  # Ein einzelnes Buch kann viele Seiten besitzen.
+
+
+def book_identity(url):
+    """Book URL normalisieren: '?pg=1' und Grund-URL haben dieselbe ID."""
+    p = urlsplit(str(url or ''))
+    if p.hostname != 'data.matricula-online.eu' or p.scheme not in ('http', 'https'):
+        raise ValueError('Unzulässige Kirchenbuch-URL: ' + str(url))
+    path = re.sub(r'/+', '/', p.path).rstrip('/') + '/'
+    if len([s for s in path.split('/') if s]) < 5:
+        raise ValueError('URL enthält keine vollständige Kirchenbuch-Signatur: ' + str(url))
+    canonical = 'https://data.matricula-online.eu' + path
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest(), canonical
+
+
+def safe_component(s, maximum=42):
+    value = unicodedata.normalize('NFKD', str(s))
+    value = ''.join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r'[^a-zA-Z0-9._-]+', '_', value).strip(' ._')
+    return (value or 'Unbekannt')[:maximum].rstrip(' ._') or 'Unbekannt'
+
+
+def item_record(land, archive, place, book):
+    k, base = book_identity(book.get('url_base') or book.get('url'))
+    return (k, base, land, archive['url'], archive['name'],
+            place['url'], place['name'], str(book.get('signatur', '')),
+            str(book.get('titel', '')), str(book.get('typ', '')),
+            str(book.get('zeitraum', '')), str(book.get('url') or base + '?pg=1'))
+
+
+class CatalogStore:
+    """Metadaten und Downloadstatus getrennt, damit das 5.1-JSON unverändert bleibt."""
+    def __init__(self, path=DATABASE_PATH):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as conn:
+            conn.executescript('''
+              CREATE TABLE IF NOT EXISTS books (
+                book_key TEXT PRIMARY KEY, canonical_url TEXT NOT NULL UNIQUE,
+                land TEXT NOT NULL, archive_url TEXT NOT NULL, archive_name TEXT NOT NULL,
+                place_url TEXT NOT NULL, place_name TEXT NOT NULL,
+                signature TEXT, title TEXT, kind TEXT, date_range TEXT,
+                viewer_url TEXT NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS ix_books_place ON books(place_url);
+              CREATE INDEX IF NOT EXISTS ix_books_archive ON books(archive_url);
+              CREATE TABLE IF NOT EXISTS downloads (
+                book_key TEXT PRIMARY KEY REFERENCES books(book_key),
+                status TEXT NOT NULL DEFAULT 'offen',
+                folder TEXT, pages INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0, error TEXT,
+                changed_at TEXT NOT NULL, finished_at TEXT
+              );
+              CREATE TABLE IF NOT EXISTS image_files (
+                book_key TEXT NOT NULL REFERENCES books(book_key),
+                filename TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                PRIMARY KEY(book_key,filename)
+              );
+              CREATE TABLE IF NOT EXISTS sources (
+                land TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+              );
+            ''')
+            # Ein vorzeitig abgebrochener Prozess gilt nicht als vollständig.
+            conn.execute("UPDATE downloads SET status='unterbrochen' WHERE status='laeuft'")
+
+    @contextmanager
+    def connect(self):
+        conn = sqlite3.connect(str(self.path), timeout=30)
+        try:
+            conn.execute('PRAGMA busy_timeout = 30000')
+            conn.execute('PRAGMA journal_mode = WAL')
+            conn.execute('PRAGMA foreign_keys = ON')
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def fingerprint(land):
+        src = list(output_paths(land)[:1]) + [journal_path(land)]
+        bits = []
+        for file in src:
+            if file.exists():
+                st = file.stat()
+                bits.append(f'{file.name}:{st.st_size}:{st.st_mtime_ns}')
+        return '|'.join(bits)
+
+    def sync_catalog(self, data, force=False, callback=None):
+        """Alle Metadaten upserten; Downloads und lokale Dateien NIE zurücksetzen."""
+        land = data['land']
+        fingerprint = self.fingerprint(land)
+        with self.connect() as conn:
+            old = conn.execute('SELECT fingerprint FROM sources WHERE land=?', (land,)).fetchone()
+            if not force and old and old[0] == fingerprint:
+                n = conn.execute('SELECT COUNT(*) FROM books WHERE land=?', (land,)).fetchone()[0]
+                return n, False
+            upsert = '''INSERT INTO books
+             (book_key,canonical_url,land,archive_url,archive_name,place_url,place_name,
+              signature,title,kind,date_range,viewer_url)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(book_key) DO UPDATE SET
+               canonical_url=excluded.canonical_url,land=excluded.land,
+               archive_url=excluded.archive_url,archive_name=excluded.archive_name,
+               place_url=excluded.place_url,place_name=excluded.place_name,
+               signature=excluded.signature,title=excluded.title,kind=excluded.kind,
+               date_range=excluded.date_range,viewer_url=excluded.viewer_url'''
+            pending = []
+            processed = skipped = 0
+            for archive in data.get('archive', {}).values():
+                for place in archive.get('orte', {}).values():
+                    for book in place.get('buecher', {}).values():
+                        try:
+                            pending.append(item_record(land, archive, place, book))
+                        except (ValueError, KeyError):
+                            skipped += 1
+                            continue
+                        processed += 1
+                        if len(pending) >= 1000:
+                            conn.executemany(upsert, pending)
+                            pending.clear()
+                            if callback and processed % 15000 < 1000:
+                                callback(f'SQLite-Katalog: {processed:,} Bücher verarbeitet…'.replace(',', '.'))
+            if pending:
+                conn.executemany(upsert, pending)
+            conn.execute('INSERT INTO sources(land,fingerprint,updated_at) VALUES(?,?,?) '
+                         'ON CONFLICT(land) DO UPDATE SET fingerprint=excluded.fingerprint, '
+                         'updated_at=excluded.updated_at', (land, fingerprint, utcnow()))
+            n = conn.execute('SELECT COUNT(*) FROM books WHERE land=?', (land,)).fetchone()[0]
+        if callback and skipped:
+            callback(f'{skipped} ungültige Buch-URLs beim SQLite-Import übersprungen.')
+        return n, True
+
+    def ensure_book(self, record):
+        with self.connect() as conn:
+            conn.execute('''INSERT INTO books
+               (book_key,canonical_url,land,archive_url,archive_name,place_url,place_name,
+               signature,title,kind,date_range,viewer_url)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(book_key) DO UPDATE SET
+                 archive_name=excluded.archive_name,place_name=excluded.place_name,
+                 title=excluded.title,kind=excluded.kind,date_range=excluded.date_range,
+                 viewer_url=excluded.viewer_url''', record)
+
+    def get_download(self, key):
+        with self.connect() as conn:
+            conn.row_factory = sqlite3.Row
+            r = conn.execute('SELECT * FROM downloads WHERE book_key=?', (key,)).fetchone()
+            return dict(r) if r else None
+
+    def get_statuses(self, keys):
+        if not keys: return {}
+        results = {}
+        with self.connect() as conn:
+            for i in range(0, len(keys), 250):
+                batch = keys[i:i+250]
+                placeholders = ','.join('?' for _ in batch)
+                for key, status, pages in conn.execute(
+                    f'SELECT book_key,status,pages FROM downloads WHERE book_key IN ({placeholders})', batch
+                ):
+                    results[key] = (status, pages)
+        return results
+
+    def set_download(self, key, status, folder=None, pages=0, size=0, error=None, done=False):
+        with self.connect() as conn:
+            conn.execute('''INSERT INTO downloads
+                 (book_key,status,folder,pages,bytes,error,changed_at,finished_at)
+                 VALUES(?,?,?,?,?,?,?,?)
+                 ON CONFLICT(book_key) DO UPDATE SET status=excluded.status,
+                   folder=excluded.folder,pages=excluded.pages,bytes=excluded.bytes,
+                   error=excluded.error,changed_at=excluded.changed_at,
+                   finished_at=excluded.finished_at''',
+                 (key, status, str(folder) if folder else None, pages, size, error,
+                  utcnow(), utcnow() if done else None))
+
+    def register_files(self, key, folder, images):
+        with self.connect() as conn:
+            conn.execute('DELETE FROM image_files WHERE book_key=?', (key,))
+            conn.executemany('INSERT INTO image_files(book_key,filename,size_bytes) VALUES(?,?,?)',
+                             ((key, str(p.relative_to(folder)), p.stat().st_size) for p in images))
+
+    def stats(self):
+        with self.connect() as conn:
+            books = conn.execute('SELECT COUNT(*) FROM books').fetchone()[0]
+            done = conn.execute("SELECT COUNT(*) FROM downloads WHERE status='heruntergeladen'").fetchone()[0]
+            pending = conn.execute("SELECT COUNT(*) FROM downloads WHERE status IN ('fehler','unterbrochen')").fetchone()[0]
+        return books, done, pending
+
+    def search_books(self, term, land=None, limit=200):
+        """Suche nach Ort, Buchsignatur, Typ und Titel ohne den ganzen Baum aufzubauen.
+
+        Gibt (item_record, downloadstatus, seitenzahl) zurück.
+        """
+        term = str(term or '').strip()
+        if len(term) < 2:
+            return []
+        # Prozent/Unterstrich sind hier Suchtext, keine LIKE-Musterzeichen.
+        escaped = term.replace('!', '!!').replace('%', '!%').replace('_', '!_')
+        pattern = '%' + escaped + '%'
+        sql = """SELECT b.book_key,b.canonical_url,b.land,b.archive_url,b.archive_name,
+                    b.place_url,b.place_name,b.signature,b.title,b.kind,b.date_range,
+                    b.viewer_url,COALESCE(d.status,'offen'),COALESCE(d.pages,0)
+                 FROM books b LEFT JOIN downloads d ON d.book_key=b.book_key
+                 WHERE (b.place_name LIKE ? ESCAPE '!' OR b.signature LIKE ? ESCAPE '!'
+                    OR b.title LIKE ? ESCAPE '!' OR b.kind LIKE ? ESCAPE '!')"""
+        args = [pattern]*4
+        if land:
+            sql += ' AND b.land=?'
+            args.append(land)
+        sql += ' ORDER BY b.place_name,b.signature LIMIT ?'
+        args.append(max(1,min(500,int(limit))))
+        with self.connect() as conn:
+            return [(tuple(row[:12]),row[12],row[13]) for row in conn.execute(sql,args)]
+
+    def export_downloads(self, dest):
+        with self.connect() as conn, Path(dest).open('w', encoding='utf-8') as fh:
+            fh.write('Land\tArchiv\tOrt\tSignatur\tTitel\tZeitraum\tURL\tStatus\tBilder\tBytes\tOrdner\tFehler\n')
+            for row in conn.execute('''SELECT b.land,b.archive_name,b.place_name,b.signature,b.title,
+                b.date_range,b.viewer_url,COALESCE(d.status,'offen'),COALESCE(d.pages,0),
+                COALESCE(d.bytes,0),COALESCE(d.folder,''),COALESCE(d.error,'')
+                FROM books b LEFT JOIN downloads d ON d.book_key=b.book_key
+                ORDER BY b.land,b.archive_name,b.place_name,b.signature'''):
+                fh.write('\t'.join(str(v).replace('\t',' ').replace('\r',' ').replace('\n',' ') for v in row)+'\n')
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def download_directory(root, record):
+    key, _, land, _, archive, _, place, signature, *_ = record
+    return (Path(root) / safe_component(land, 25) /
+            safe_component(archive, 43) / safe_component(place, 43) /
+            f'{safe_component(signature, 24)}_{key[:12]}')
+
+
+def valid_image(path):
+    try:
+        if path.stat().st_size < 16: return False
+        with path.open('rb') as fh: head = fh.read(20)
+        return (head.startswith(b'\xff\xd8\xff') or head.startswith(b'\x89PNG\r\n\x1a\n') or
+                head.startswith((b'II*\x00', b'MM\x00*')) or
+                (head.startswith(b'RIFF') and head[8:12] == b'WEBP') or
+                head.startswith(b'\x00\x00\x00\x0cjP  \r\n\x87\n') or
+                head.startswith(b'\xff\x4f\xff\x51'))
+    except OSError:
+        return False
+
+
+def list_images(folder):
+    p = Path(folder)
+    if not p.is_dir(): return []
+    return sorted((f for f in p.rglob('*') if f.is_file() and f.suffix.casefold() in IMAGE_EXT
+                   and valid_image(f)), key=lambda x: str(x).casefold())
+
+
+def cli_command():
+    exe = shutil.which('matricula-online-scraper')
+    if exe: return [exe]
+    if importlib.util.find_spec('matricula_online_scraper'):
+        return [sys.executable, '-m', 'matricula_online_scraper']
+    raise RuntimeError('Downloader nicht installiert. Bitte in PowerShell ausführen:\n'
+                       'py -m pip install -U matricula-online-scraper')
+
+
+def terminate_process(proc):
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def download_one(record, root, catalog, stop_event, post, set_process):
+    """Lädt ein einzelnes, bewusst gewähltes Buch in isolierten Arbeitsordner."""
+    key, base = record[:2]
+    folder = download_directory(root, record)
+    final = folder / 'bilder'
+    partial = folder / '.teilweise'
+    manifest = folder / 'manifest.json'
+    folder.mkdir(parents=True, exist_ok=True)
+    if manifest.exists() and list_images(final):
+        images = list_images(final)
+        catalog.register_files(key, final, images)
+        catalog.set_download(key, 'heruntergeladen', final, len(images),
+                             sum(p.stat().st_size for p in images), done=True)
+        return f'Bereits vorhanden: {len(images)} Bilddateien'
+    if final.exists():
+        raise RuntimeError('Zielordner „bilder“ existiert ohne gültiges Manifest. '
+                           'Bitte Dateien prüfen, nichts wird überschrieben: ' + str(final))
+    partial.mkdir(parents=True, exist_ok=True)
+    catalog.set_download(key, 'laeuft', partial)
+    post('log', f'Start: {record[6]} / {record[7]} → {folder}')
+    cmd = cli_command() + ['parish', 'fetch', record[-1], '-o', str(partial)]
+    proc = None
+    output = queue.Queue()
+    try:
+        if stop_event.is_set(): raise InterruptedError('Download vom Benutzer angehalten')
+        proc = subprocess.Popen(cmd, cwd=str(folder), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                text=True, encoding='utf-8', errors='replace', bufsize=1)
+        set_process(proc)
+        def forward_output():
+            try:
+                for line in proc.stdout:
+                    output.put(line.rstrip())
+            finally:
+                output.put(None)
+        threading.Thread(target=forward_output, daemon=True).start()
+        last_activity = time.monotonic()
+        eof = False
+        while True:
+            if stop_event.is_set(): raise InterruptedError('Download vom Benutzer angehalten')
+            if time.monotonic() - last_activity > DOWNLOAD_IDLE_TIMEOUT:
+                raise TimeoutError('Downloader hat seit 20 Minuten keine Ausgabe geliefert.')
+            try:
+                line = output.get(timeout=0.5)
+                if line is None:
+                    eof = True
+                elif line:
+                    last_activity = time.monotonic()
+                    if re.search(r'(HTTP\s*(403|429)|\b403\s+Forbidden\b|\b429\s+Too Many Requests\b)', line, re.I):
+                        raise PermissionError('Server blockiert den Download (403/429). Keine Wiederholung.')
+                    match = re.search(r'(\d+)\s*/\s*(\d+)', line)
+                    if match: post('progress', (int(match.group(1)), int(match.group(2))))
+                    post('log', line[:250])
+            except queue.Empty:
+                pass
+            if eof and proc.poll() is not None and output.empty(): break
+        code = proc.wait(timeout=15)
+        if code != 0:
+            raise RuntimeError(f'Downloader meldet Exit-Code {code}. Teildaten bleiben erhalten.')
+        imgs = list_images(partial)
+        if not imgs:
+            raise RuntimeError('Downloader beendete sich ohne Fehler, aber keine gültigen Bilder gefunden.')
+        if stop_event.is_set(): raise InterruptedError('Download vom Benutzer angehalten')
+        partial.rename(final)
+        imgs = list_images(final)
+        total_bytes = sum(p.stat().st_size for p in imgs)
+        manifest_data = {'buch_url': base, 'viewer_url': record[-1], 'buch_key': key,
+                         'land': record[2], 'archiv': record[4], 'ort': record[6],
+                         'signatur': record[7], 'status': 'heruntergeladen',
+                         'bilder': len(imgs), 'bytes': total_bytes, 'zeit': utcnow(),
+                         'quelle': 'matricula-online-scraper parish fetch'}
+        atomic_json(manifest, manifest_data)
+        catalog.register_files(key, final, imgs)
+        catalog.set_download(key, 'heruntergeladen', final, len(imgs), total_bytes, done=True)
+        return f'{len(imgs)} Bilder ({total_bytes/1024/1024:.1f} MiB) gespeichert'
+    except Exception as exc:
+        status = 'unterbrochen' if isinstance(exc, InterruptedError) else 'fehler'
+        catalog.set_download(key, status, partial, error=str(exc))
+        raise
+    finally:
+        terminate_process(proc)
+        set_process(None)
+
+
 ctk.set_appearance_mode('Dark')
 ctk.set_default_color_theme('blue')
 
@@ -499,20 +882,30 @@ ctk.set_default_color_theme('blue')
 class Browser(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title('Matricula Bestandsbrowser 5.1 · Bundesland / Diözese')
-        self.geometry('1260x870')
-        self.minsize(1020, 670)
+        self.title('Matricula Bestandsbrowser 5.2 · Bestände & Downloads')
+        self.geometry('1360x970')
+        self.minsize(1080, 760)
         self.parser = Scraper()
         self.data = None
+        self.catalog = CatalogStore()
+        self.catalog_busy = False
+        self.download_busy = False
+        self.pdf_busy = False
+        self.download_terms_ack = False
+        self.download_events = queue.Queue()
+        self.download_stop = threading.Event()
+        self.active_process = None
+        self.proc_lock = threading.Lock()
+        self.download_root = tk.StringVar(value=str(self._local_config().get(
+            'download_root', DEFAULT_DOWNLOAD_ROOT)))
         self.tree_meta = {}
         self.main = ctk.CTkFrame(self)
         self.main.pack(fill='both', expand=True, padx=12, pady=12)
         ctk.CTkLabel(self.main,
-            text='🏛️ Matricula 5.1 · Bundesländer → Diözesen → Orte → Bücher',
+            text='🏛️ Matricula 5.2 · Bestandsbrowser + Buch-Downloads',
             font=ctk.CTkFont(size=22, weight='bold')).pack(anchor='w', padx=12, pady=(10, 2))
         ctk.CTkLabel(self.main,
-            text='Ein Klick = maximal 25 Orte. Bestehende Bücher bleiben erhalten. '
-                 'Bundesländer sind Archivgruppen, keine geografische Pfarrei-Zuordnung.',
+            text='Bestandsscan maximal 25 Orte pro Paket · Manuelle Einzelbuch-Downloads · SQLite speichert Downloadstatus.',
             text_color='#e5b85c').pack(anchor='w', padx=14, pady=(0, 8))
 
         opts = ctk.CTkFrame(self.main)
@@ -579,6 +972,20 @@ class Browser(ctk.CTk):
         self.btn_export = ctk.CTkButton(actions, text='📄 JSON / TXT exportieren',
                                        command=self.export_now, width=180)
         self.btn_export.pack(side='right', padx=4)
+        self.btn_db_sync = ctk.CTkButton(actions, text='🗃 SQLite abgleichen',
+                                          command=lambda: self.request_catalog_sync(force=True), width=145)
+        self.btn_db_sync.pack(side='right', padx=4)
+
+        search_frame = ctk.CTkFrame(self.main, fg_color='transparent')
+        search_frame.pack(fill='x', padx=12, pady=(2, 3))
+        self.quick_search = ctk.CTkEntry(search_frame,
+            placeholder_text='Buchsuche in SQLite: Ort, Signatur oder Titel (z. B. Peißenberg, 01-01D)')
+        self.quick_search.pack(side='left', fill='x', expand=True, padx=(0, 6))
+        self.quick_search.bind('<Return>', lambda _event: self.find_book())
+        ctk.CTkButton(search_frame, text='🔎 Bücher suchen', width=145,
+                      command=self.find_book).pack(side='left', padx=(0, 6))
+        ctk.CTkButton(search_frame, text='↩ Verzeichnis', width=130,
+                      command=self.refresh_tree).pack(side='left')
 
         tree_frame = tk.Frame(self.main)
         tree_frame.pack(fill='both', expand=True, padx=12, pady=(4, 6))
@@ -596,18 +1003,55 @@ class Browser(ctk.CTk):
         self.tree.bind('<<TreeviewOpen>>', self.expand_tree)
         self.tree.bind('<<TreeviewSelect>>', self.show_detail)
         self.tree.bind('<Double-1>', self.pick_scope_from_tree)
-        self.details = ctk.CTkTextbox(self.main, height=65)
+        self.details = ctk.CTkTextbox(self.main, height=62)
         self.details.pack(fill='x', padx=12, pady=4)
+
+        dl = ctk.CTkFrame(self.main)
+        dl.pack(fill='x', padx=12, pady=(2, 4))
+        dl.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(dl, text='Speicherort für Kirchenbücher:', anchor='w').grid(
+            row=0, column=0, columnspan=3, sticky='w', padx=8, pady=(7, 0))
+        ctk.CTkEntry(dl, textvariable=self.download_root).grid(
+            row=1, column=0, columnspan=3, sticky='ew', padx=8, pady=(2, 6))
+        ctk.CTkButton(dl, text='📁 Ziel wählen', width=115,
+                      command=self.choose_download_dir).grid(row=1, column=3, padx=8, pady=(2, 6))
+        self.btn_download = ctk.CTkButton(dl, text='⬇ Ausgewähltes Buch herunterladen',
+            command=self.download_selected, fg_color='#227d4c', hover_color='#1e633d', width=245)
+        self.btn_download.grid(row=2, column=0, padx=8, pady=(2, 6), sticky='w')
+        ctk.CTkButton(dl, text='📂 Ordner öffnen', command=self.open_download_folder,
+                      width=140).grid(row=2, column=1, padx=5, pady=(2, 6))
+        ctk.CTkButton(dl, text='🔎 Dateien prüfen', command=self.verify_selected_download,
+                      width=130).grid(row=2, column=2, padx=5, pady=(2, 6))
+        ctk.CTkButton(dl, text='📄 Buch als PDF', command=self.make_selected_pdf,
+                      width=130).grid(row=2, column=3, padx=8, pady=(2, 6))
+        self.download_stats = ctk.CTkLabel(dl, text='SQLite-Katalog wird vorbereitet…', anchor='w')
+        self.download_stats.grid(row=3, column=0, columnspan=4, sticky='ew', padx=8, pady=(1, 5))
+        pb = ctk.CTkFrame(self.main, fg_color='transparent')
+        pb.pack(fill='x', padx=12, pady=0)
+        self.download_progress = ctk.CTkProgressBar(pb)
+        self.download_progress.pack(side='left', fill='x', expand=True)
+        self.download_progress.set(0)
+        self.download_progress_label = ctk.CTkLabel(pb, text='Download bereit.', width=225)
+        self.download_progress_label.pack(side='right', padx=6)
+        self.download_log = ctk.CTkTextbox(self.main, height=72, font=('Consolas', 11))
+        self.download_log.pack(fill='x', padx=12, pady=(2, 3))
+        self.download_log.configure(state='disabled')
         bottom = ctk.CTkFrame(self.main, fg_color='transparent')
         bottom.pack(fill='x', padx=12, pady=4)
         ctk.CTkButton(bottom, text='📋 Ausgewählte URL kopieren',
                       command=self.copy_url, width=230).pack(side='left', padx=3)
+        ctk.CTkButton(bottom, text='📑 Downloadstatus exportieren',
+                      command=self.export_catalog_with_status, width=235).pack(side='left', padx=4)
         ctk.CTkButton(bottom, text='❓ Bedienung / Hinweise',
                       command=self.help, width=200).pack(side='right', padx=3)
         self.stat = ctk.CTkLabel(self.main, text='', anchor='w')
         self.stat.pack(fill='x', padx=15, pady=(2, 7))
         self.load_local()
         self.on_region(REGION_PROMPT)
+        self.refresh_catalog_stats()
+        self.after(180, self.process_download_events)
+        self.after(550, self.request_catalog_sync)
+        self.protocol('WM_DELETE_WINDOW', self.on_close)
 
     def say(self, message):
         self.after(0, lambda s=str(message): self.stat.configure(text=s[:230]))
@@ -620,6 +1064,7 @@ class Browser(ctk.CTk):
         self.area.set(AREA_OPTIONS[0])
         self.package.set(PACKAGE_DEFAULT)
         self.load_local()
+        self.after(100, self.request_catalog_sync)
         self.update_preview()
 
     def on_region(self, region):
@@ -721,6 +1166,32 @@ class Browser(ctk.CTk):
                 self.tree_meta[aid] = ('archive', region, url)
                 if places: self.tree.insert(aid, 'end', text='…')
 
+    def find_book(self):
+        if self.catalog_busy:
+            messagebox.showinfo('SQLite-Katalog', 'Der Katalog wird gerade aufgebaut. Suche danach erneut.')
+            return
+        term = self.quick_search.get().strip()
+        if len(term) < 2:
+            messagebox.showinfo('Buchsuche', 'Bitte mindestens zwei Zeichen eingeben.')
+            return
+        try:
+            matches = self.catalog.search_books(term, land=self.land.get(), limit=200)
+        except Exception as exc:
+            messagebox.showerror('SQLite-Buchsuche', str(exc))
+            return
+        roots = self.tree.get_children()
+        if roots:
+            self.tree.delete(*roots)
+        self.tree_meta.clear()
+        parent = self.tree.insert('', 'end', text=f'Suchergebnisse: {term} · {len(matches)} Buch/Bücher',
+                                  values=('maximal 200 Treffer', ''), open=True)
+        for record, state, pages in matches:
+            label = f'{record[6]} · {record[7]} · {record[8]}'
+            child = self.tree.insert(parent,'end',text=label,
+                values=(self.book_status_label({'status':state,'pages':pages}),record[-1]))
+            self.tree_meta[child] = ('db_book',None,record)
+        self.say(f'Buchsuche „{term}“: {len(matches)} Treffer (maximal 200).')
+
     def expand_tree(self, _=None):
         row = self.tree.focus()
         info = self.tree_meta.get(row)
@@ -740,12 +1211,25 @@ class Browser(ctk.CTk):
         else:
             archive_url, place_url = url
             place = self.data['archive'][archive_url]['orte'][place_url]
-            for b in sorted(place.get('buecher', {}).values(),
-                            key=lambda b: b.get('signatur', '')):
+            books = sorted(place.get('buecher', {}).items(),
+                           key=lambda item: item[1].get('signatur', ''))
+            keys = []
+            for b_url, b in books:
+                try: keys.append(book_identity(b.get('url_base') or b.get('url'))[0])
+                except ValueError: pass
+            statuses = self.catalog.get_statuses(keys)
+            for b_url, b in books:
+                try:
+                    key = book_identity(b.get('url_base') or b.get('url'))[0]
+                    state = statuses.get(key)
+                    status = self.book_status_label(
+                        {'status': state[0], 'pages': state[1]} if state else None)
+                except ValueError:
+                    status = '⚠ URL ungültig'
                 bid = self.tree.insert(row, 'end',
                        text=f"{b.get('signatur','')} · {b.get('titel','')}",
-                       values=(b.get('zeitraum',''), b.get('url', '')))
-                self.tree_meta[bid] = ('book', region, b.get('url', ''))
+                       values=(status, b.get('url', '')))
+                self.tree_meta[bid] = ('book', region, (archive_url, place_url, b_url))
 
     def pick_scope_from_tree(self, _=None):
         row = self.tree.focus()
@@ -768,7 +1252,18 @@ class Browser(ctk.CTk):
         if not row: return
         item = self.tree.item(row)
         self.details.delete('1.0', 'end')
-        self.details.insert('1.0', f"{item['text']}\n" + ' | '.join(map(str,item.get('values',[]))))
+        description = f"{item['text']}\n" + ' | '.join(map(str, item.get('values', [])))
+        book = self._selected_book()
+        if book:
+            d = self.catalog.get_download(book[0])
+            description += f'\nSignatur: {book[7]} | Zeitraum: {book[10]} | URL: {book[-1]}'
+            if d:
+                description += (f"\nDownload: {d['status']} | Bilder: {d['pages']}"
+                                f" | Ordner: {d['folder']}"
+                                f" | Fehler: {d['error'] or '-'}")
+            else:
+                description += '\nDownload: noch nicht heruntergeladen'
+        self.details.insert('1.0', description)
 
     def copy_url(self):
         row = self.tree.focus()
@@ -785,8 +1280,17 @@ class Browser(ctk.CTk):
         self.btn_index.configure(state='disabled' if busy else 'normal')
         self.btn_locations.configure(state='disabled' if busy else 'normal')
         self.btn_export.configure(state='disabled' if busy else 'normal')
+        if hasattr(self, 'btn_download'):
+            self.btn_download.configure(state='disabled' if busy or self.catalog_busy else 'normal')
+        if hasattr(self, 'btn_db_sync'):
+            self.btn_db_sync.configure(state='disabled' if busy or self.catalog_busy else 'normal')
+        for widget in (self.land, self.region, self.archive):
+            widget.configure(state='disabled' if busy else 'normal')
 
     def _start_worker(self, work, only_index=False):
+        if self.catalog_busy or self.download_busy or self.pdf_busy:
+            messagebox.showwarning('Andere Aufgabe', 'Bitte die laufende SQLite- oder Downloadaufgabe beenden.')
+            return
         self.parser.stop.clear()
         self.set_busy(True)
         def task():
@@ -836,6 +1340,9 @@ class Browser(ctk.CTk):
         self._start_worker(lambda: self.parser.run(*args))
 
     def stop_scan(self):
+        if self.download_busy:
+            self.stop_download()
+            return
         self.parser.stop.set()
         self.say('Stopp angefordert · Letzter Ort ist im Fortschrittsjournal gesichert.')
 
@@ -857,6 +1364,7 @@ class Browser(ctk.CTk):
             self.on_region(selection_region)
             if selection_archive in self.archive_values: self.archive.set(selection_archive)
         self.update_preview()
+        self.after(150, self.request_catalog_sync)
         if error:
             self.say('Unterbrochen: ' + error)
             messagebox.showwarning('Scan unterbrochen', error)
@@ -864,7 +1372,7 @@ class Browser(ctk.CTk):
             self.say('Index geladen.' if only_index else 'Paket erledigt und JSON/TXT gespeichert.')
 
     def help(self):
-        messagebox.showinfo('Matricula 5.1 · Auswahl und Wiederaufnahme',
+        messagebox.showinfo('Matricula 5.2 · Scan und Download',
             '1. Land wählen, danach Bundesland / Region.\n'
             '2. Archivliste laden (nur beim ersten Mal notwendig).\n'
             '3. Bewusst eine Diözese / ein Archiv auswählen.\n'
@@ -877,7 +1385,326 @@ class Browser(ctk.CTk):
             'Wichtig: Bundesländer sind Archivgruppen, keine exakte Gemeinde- oder '
             'Regierungsbezirkszuordnung. Mehrfachzuordnungen sind möglich.\n'
             'Gefundene fertige Orte werden nicht erneut gescannt.\n'
-            'Bei HTTP 403/429 wird gestoppt; keine Umgehung von Sperren.')
+            'Bei HTTP 403/429 wird gestoppt; keine Umgehung von Sperren.\n\n'
+            '9. Zum Download ein Kirchenbuch im Baum anklicken und den grünen Button nutzen.\n'
+            '10. SQLite merkt sich Downloadstatus und die Bilddateien pro Buch.\n'
+            '11. PDF optional aus den bereits geladenen Bildern erstellen.\n'
+            '12. PNG/JPG/TIFF Dateien liegen in Matricula_Buecher, nicht in SQLite.\n'
+            '13. Die Schnellsuche findet Kirchenbücher auch ohne Aufklappen der Archivstruktur.\n'
+            '14. Downloadstatus werden im SQLite-Katalog gespeichert, nicht im Bestands-JSON.')
+
+
+    # -----------------------------------------------------------------
+    # SQLite + Downloads (bewusste Einzelauswahl, kein Massendownload)
+    # -----------------------------------------------------------------
+    def _selected_book(self):
+        info = self.tree_meta.get(self.tree.focus())
+        if not info or not self.data:
+            return None
+        if info[0] == 'db_book':
+            return info[2]
+        if info[0] != 'book':
+            return None
+        archive_url, place_url, book_url = info[2]
+        try:
+            archive = self.data['archive'][archive_url]
+            place = archive['orte'][place_url]
+            book = place['buecher'][book_url]
+            return item_record(self.data['land'], archive, place, book)
+        except (KeyError, ValueError):
+            return None
+
+    def _local_config(self):
+        config_path = ROOTDIR / 'matricula-local-config.json'
+        try:
+            raw = json.loads(config_path.read_text(encoding='utf-8'))
+            return raw if isinstance(raw, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def choose_download_dir(self):
+        folder = filedialog.askdirectory(title='Ordner für heruntergeladene Kirchenbücher',
+                                        initialdir=self.download_root.get())
+        if folder:
+            self.download_root.set(folder)
+            atomic_json(ROOTDIR / 'matricula-local-config.json',
+                        {'download_root': folder})
+
+    def log_download(self, msg):
+        self.download_log.configure(state='normal')
+        self.download_log.insert('end', str(msg).strip() + '\n')
+        # Log klein halten, damit die GUI bei sehr langen Buchdownloads flüssig bleibt.
+        if int(self.download_log.index('end-1c').split('.')[0]) > 400:
+            self.download_log.delete('1.0', '160.0')
+        self.download_log.see('end')
+        self.download_log.configure(state='disabled')
+
+    def post_download(self, kind, payload):
+        self.download_events.put((kind, payload))
+
+    def process_download_events(self):
+        try:
+            for _ in range(75):
+                kind, payload = self.download_events.get_nowait()
+                if kind == 'log':
+                    self.log_download(payload)
+                elif kind == 'progress':
+                    a, b = payload
+                    if b > 0:
+                        self.download_progress.set(min(1, max(0, a/b)))
+                        self.download_progress_label.configure(text=f'{a}/{b} Seiten (CLI-Angabe)')
+                elif kind == 'status':
+                    self.download_progress_label.configure(text=str(payload))
+                elif kind == 'download_finished':
+                    ok, detail, key, row = payload
+                    self.download_busy = False
+                    self.active_process = None
+                    self.set_busy(False)
+                    self.download_progress_label.configure(
+                        text=('Heruntergeladen ✓' if ok else 'Unterbrochen / Fehler'))
+                    if ok:
+                        self.download_progress.set(1)
+                    status = self.catalog.get_download(key)
+                    # Während des Downloads darf die Suche/Ansicht gewechselt werden.
+                    # Keine neue Baumzeile mit einer eventuell wiederverwendeten Tree-ID markieren.
+                    selected_row_record = self._selected_book() if self.tree.focus() == row else None
+                    if selected_row_record and selected_row_record[0] == key and self.tree.exists(row):
+                        self.tree.set(row, 'status', self.book_status_label(status))
+                        self.show_detail()
+                    self.log_download(('✓ ' if ok else '⚠ ') + detail)
+                    self.refresh_catalog_stats()
+                    if not ok:
+                        messagebox.showwarning('Kirchenbuchdownload', detail)
+                elif kind == 'sync_finished':
+                    self.catalog_busy = False
+                    self.btn_db_sync.configure(state='normal')
+                    self.btn_download.configure(state='normal' if not self.download_busy else 'disabled')
+                    self.refresh_catalog_stats()
+                    self.log_download(payload)
+                    self.say(payload)
+                elif kind == 'pdf_finished':
+                    ok, detail = payload
+                    self.pdf_busy = False
+                    self.set_busy(False)
+                    self.log_download(('✓ ' if ok else '⚠ ') + detail)
+                    self.download_progress_label.configure(text=('PDF fertig' if ok else 'PDF-Fehler'))
+        except queue.Empty:
+            pass
+        self.after(120, self.process_download_events)
+
+    @staticmethod
+    def book_status_label(download):
+        if not download: return '⬇ offen'
+        state = download['status']
+        if state == 'heruntergeladen':
+            return f"✓ heruntergeladen ({download.get('pages', 0)} Bilder)"
+        if state == 'laeuft': return '⏳ lädt…'
+        if state == 'unterbrochen': return '⏸ unterbrochen'
+        if state == 'fehler': return '✕ Fehler'
+        if state == 'dateien_fehlen': return '! Dateien fehlen'
+        return state
+
+    def refresh_catalog_stats(self):
+        try:
+            total, done, errors = self.catalog.stats()
+            self.download_stats.configure(text=(
+                f'SQLite: {total:,} Bücher | {done:,} heruntergeladen | '
+                f'{errors:,} Fehler/Abbrüche'.replace(',', '.')))
+        except Exception as exc:
+            self.download_stats.configure(text='SQLite-Fehler: ' + str(exc))
+
+    def request_catalog_sync(self, force=False):
+        if self.catalog_busy or self.download_busy or self.pdf_busy or not self.data:
+            return
+        self.catalog_busy = True
+        self.btn_db_sync.configure(state='disabled')
+        self.btn_download.configure(state='disabled')
+        data = self.data
+        def worker():
+            try:
+                total, changed = self.catalog.sync_catalog(
+                    data, force, lambda s: self.post_download('status', s))
+                message = (f'{total:,} Bücher in SQLite, '
+                           f'{"Katalog aktualisiert" if changed else "bereits aktuell"}').replace(',', '.')
+            except Exception as exc:
+                message = 'SQLite-Synchronisierung fehlgeschlagen: ' + str(exc)
+            self.download_events.put(('sync_finished', message))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def download_selected(self):
+        if self.download_busy or self.catalog_busy or self.pdf_busy or self.btn_scan.cget('state') == 'disabled':
+            messagebox.showwarning('Download', 'Aktuell läuft eine andere Aufgabe.')
+            return
+        record = self._selected_book()
+        if not record:
+            messagebox.showinfo('Buch auswählen',
+                'Bitte im Verzeichnisbaum einen Ort aufklappen und EIN Kirchenbuch anklicken.')
+            return
+        key = record[0]
+        self.catalog.ensure_book(record)
+        previous = self.catalog.get_download(key)
+        if previous and previous['status'] == 'heruntergeladen':
+            folder = Path(previous['folder'] or '')
+            if list_images(folder):
+                messagebox.showinfo('Bereits heruntergeladen',
+                    f'Dieses Buch ist bereits katalogisiert ({previous["pages"]} Bilder).\n\n{folder}')
+                return
+            self.catalog.set_download(key, 'dateien_fehlen', folder,
+                                      error='Registrierter Zielordner enthält keine lesbaren Bilder.')
+        if not self.download_terms_ack:
+            consent = messagebox.askyesno('Matricula Nutzungsbedingungen',
+                'Kirchenbuchbilder dürfen nur im Rahmen der aktuellen Matricula-'
+                'Nutzungsbedingungen und geltenden Gesetze verwendet werden.\n\n'
+                'Dieses Programm startet ausschließlich den von dir gewählten '
+                'Einzelbuch-Download. Es umgeht keine Zugangssperren.\n\n'
+                'Hast du die Bedingungen geprüft und möchtest du fortfahren?')
+            if not consent: return
+            self.download_terms_ack = True
+        if not messagebox.askyesno('Einzelnes Kirchenbuch herunterladen',
+                                   f'{record[4]}\n{record[6]}\n{record[7]} · {record[8]}\n'
+                                   f'{record[10]}\n\nDownload wirklich starten?'):
+            return
+        self.download_stop.clear()
+        self.download_busy = True
+        self.set_busy(True)
+        self.download_progress.set(0)
+        self.download_progress_label.configure(text='Download läuft…')
+        self.download_row = self.tree.focus()
+        row = self.download_row
+        self.log_download('––––––––––––––––––––––––––––')
+        def worker():
+            try:
+                # Matricula-Sperren respektieren, bevor der externe Downloader startet.
+                self.parser.robots_check()
+                if not self.parser.robot.can_fetch(self.parser.ua, record[-1]):
+                    raise PermissionError('robots.txt untersagt diesen Abruf.')
+                result = download_one(record, self.download_root.get(), self.catalog,
+                                      self.download_stop, self.post_download,
+                                      self._remember_process)
+                self.post_download('download_finished', (True, result, key, row))
+            except Exception as exc:
+                # Auch einen abgewiesenen Vorab-Check im Downloadkatalog dokumentieren.
+                try:
+                    previous_state = self.catalog.get_download(key)
+                    if not previous_state or previous_state['status'] not in ('fehler','unterbrochen'):
+                        self.catalog.set_download(key, 'fehler', error=str(exc))
+                except Exception:
+                    pass
+                self.post_download('download_finished', (False, str(exc), key, row))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remember_process(self, proc):
+        with self.proc_lock:
+            self.active_process = proc
+
+    def stop_download(self):
+        self.download_stop.set()
+        with self.proc_lock:
+            proc = self.active_process
+        if proc:
+            # Nicht im UI-Thread auf einen möglicherweise blockierenden Prozess warten.
+            threading.Thread(target=terminate_process, args=(proc,), daemon=True).start()
+        self.log_download('⏹ Abbruch angefordert. Bereits vorhandene Teildateien bleiben erhalten.')
+
+    def open_download_folder(self):
+        record = self._selected_book()
+        if not record:
+            messagebox.showinfo('Buch auswählen', 'Bitte ein Kirchenbuch auswählen.')
+            return
+        info = self.catalog.get_download(record[0])
+        path = Path(info['folder']) if info and info.get('folder') else download_directory(
+            self.download_root.get(), record)
+        if not path.exists():
+            messagebox.showinfo('Noch nicht heruntergeladen', str(path))
+            return
+        if sys.platform.startswith('win'):
+            os.startfile(str(path))
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', str(path)])
+        else:
+            subprocess.Popen(['xdg-open', str(path)])
+
+    def verify_selected_download(self):
+        record = self._selected_book()
+        if not record: return
+        data = self.catalog.get_download(record[0])
+        if not data:
+            messagebox.showinfo('Dateiprüfung', 'Dieses Buch wurde noch nicht heruntergeladen.')
+            return
+        folder = Path(data['folder']) if data.get('folder') else None
+        images = list_images(folder) if folder else []
+        if not images:
+            self.catalog.set_download(record[0], 'dateien_fehlen', folder,
+                                      error='Keine Bilddateien im registrierten Zielordner.')
+            messagebox.showwarning('Dateiprüfung', 'Keine gültigen Bilddateien gefunden.')
+        else:
+            messagebox.showinfo('Dateiprüfung',
+                f'{len(images)} gültige Bilddateien gefunden.\n'
+                'Hinweis: Eine vollständige Seitennummernfolge kann damit nicht garantiert werden.')
+        row = self.tree.focus()
+        if row:
+            self.tree.set(row, 'status', self.book_status_label(self.catalog.get_download(record[0])))
+        self.show_detail()
+        self.refresh_catalog_stats()
+
+    def export_catalog_with_status(self):
+        target = filedialog.asksaveasfilename(title='Katalog mit Downloadstatus exportieren',
+                  initialfile='matricula-downloadstatus.tsv', defaultextension='.tsv',
+                  filetypes=[('Tabellen als TXT/TSV', '*.tsv'), ('Textdatei', '*.txt')])
+        if target:
+            try:
+                self.catalog.export_downloads(target)
+                self.say('Downloadstatus exportiert: ' + target)
+            except Exception as exc:
+                messagebox.showerror('Exportfehler', str(exc))
+
+    def make_selected_pdf(self):
+        if self.download_busy or self.pdf_busy or self.catalog_busy or self.btn_scan.cget('state') == 'disabled':
+            return
+        record = self._selected_book()
+        if not record: return
+        previous = self.catalog.get_download(record[0])
+        if not previous or previous['status'] != 'heruntergeladen':
+            messagebox.showinfo('PDF', 'Bitte dieses Buch zuerst vollständig herunterladen.')
+            return
+        files = list_images(previous['folder'])
+        if not files:
+            messagebox.showwarning('PDF', 'Keine gültigen Bilddateien gefunden.')
+            return
+        try:
+            import img2pdf
+        except ImportError:
+            messagebox.showwarning('PDF-Modul fehlt',
+                'Für PDF-Dateien: py -m pip install img2pdf')
+            return
+        target = filedialog.asksaveasfilename(
+            title='PDF für dieses Kirchenbuch speichern',
+            initialfile=safe_component(record[7] + '_' + record[8], 65) + '.pdf',
+            initialdir=str(Path(previous['folder']).parent),
+            defaultextension='.pdf', filetypes=[('PDF-Datei', '*.pdf')])
+        if not target: return
+        self.pdf_busy = True
+        self.set_busy(True)
+        def worker():
+            tmp = Path(target + '.tmp')
+            try:
+                with tmp.open('wb') as out:
+                    img2pdf.convert(*(str(p) for p in files), outputstream=out)
+                tmp.replace(target)
+                self.post_download('pdf_finished', (True, f'PDF erstellt: {target}'))
+            except Exception as exc:
+                tmp.unlink(missing_ok=True)
+                self.post_download('pdf_finished', (False, 'PDF fehlgeschlagen: ' + str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_close(self):
+        if self.download_busy or self.pdf_busy or self.btn_scan.cget('state') == 'disabled':
+            if not messagebox.askyesno('Programm schließen',
+                                       'Es läuft noch eine Aufgabe. Wirklich abbrechen und schließen?'):
+                return
+            self.parser.stop.set()
+            self.stop_download()
+        self.destroy()
 
 
 if __name__ == '__main__':
